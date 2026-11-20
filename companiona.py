@@ -1,8 +1,12 @@
 """Daras: asistente conversacional e investigador portable con fuentes abiertas."""
 from __future__ import annotations
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import closing, contextmanager
+from queue import Empty, SimpleQueue
 import re
+import os
+import tempfile
 import sqlite3
 import threading
 import urllib.parse
@@ -45,15 +49,43 @@ def load_cerebro():
     return conversation
 
 
+PROVIDER_ENDPOINTS = frozenset({
+    API, "https://www.wikidata.org/w/api.php", "https://api.crossref.org/works",
+    "https://api.openalex.org/works", "https://api.duckduckgo.com/",
+})
+RESPONSE_LIMIT = 2 * 1024 * 1024
+SEARCH_COMMAND = re.compile(r"^(?:investiga|busca|consulta) en internet:\s*(.*)$", re.I)
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def request_json(params: dict, api: str = API) -> dict:
+    if api not in PROVIDER_ENDPOINTS:
+        raise ValueError("Proveedor no autorizado")
     url = api + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    opener = urllib.request.build_opener(RejectRedirects())
+    with opener.open(req, timeout=8) as response:
+        raw = response.read(RESPONSE_LIMIT + 1)
+    if len(raw) > RESPONSE_LIMIT:
+        raise ValueError("Respuesta de proveedor demasiado grande")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("El proveedor no devolvió un objeto JSON")
+    return data
+
+
+@contextmanager
+def open_database():
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        yield db
 
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         db.execute("""CREATE TABLE IF NOT EXISTS pages (
             pageid INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL,
             extract TEXT NOT NULL, saved_at TEXT NOT NULL)""")
@@ -69,13 +101,13 @@ def init_db():
 
 
 def remember_turn(role: str, text: str):
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         db.execute("INSERT INTO conversations(role, text, created_at) VALUES (?, ?, ?)",
                    (role, text, datetime.now().astimezone().isoformat(timespec="minutes")))
 
 
 def save_memory(note: str):
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         cursor = db.execute("INSERT INTO memories(note, created_at) VALUES (?, ?)",
                             (note, datetime.now().astimezone().isoformat(timespec="minutes")))
         return cursor.lastrowid
@@ -83,7 +115,7 @@ def save_memory(note: str):
 
 def relevant_memories(query: str) -> list[str]:
     terms = [t for t in re.findall(r"[\wáéíóúüñ]+", query.lower()) if len(t) > 3]
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         rows = db.execute("SELECT note FROM memories ORDER BY id DESC LIMIT 100").fetchall()
     ranked = sorted(((sum(note.lower().count(t) for t in terms), note) for (note,) in rows), reverse=True)
     return [note for score, note in ranked[:3] if score > 0]
@@ -94,14 +126,10 @@ def prune_if_low_space() -> str | None:
     try:
         if shutil.disk_usage(APP_DIR).free >= 512 * 1024 * 1024:
             return None
-        with sqlite3.connect(DB_PATH) as db:
-            chats = db.execute("DELETE FROM conversations WHERE julianday(created_at) < julianday('now','-30 days')").rowcount
+        with open_database() as db:
             pages = db.execute("DELETE FROM pages WHERE julianday(saved_at) < julianday('now','-90 days')").rowcount
             db.execute("DELETE FROM research_results WHERE julianday(saved_at) < julianday('now','-90 days')")
-            db.commit()
-            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            db.execute("VACUUM")
-        return f"Limpieza por poco espacio: se eliminaron {chats} conversaciones antiguas y {pages} artículos de caché. Tus recuerdos personales se conservaron."
+        return f"Limpieza por poco espacio: se retiraron {pages} artículos antiguos de caché. Se conservaron conversaciones y recuerdos."
     except (OSError, sqlite3.Error):
         return "No pude completar la limpieza automática; tus recuerdos personales siguen intactos."
 
@@ -217,14 +245,20 @@ def research_online(query: str) -> tuple[list[dict], list[str]]:
     if re.search(r"\b(estudio|investigaci[oó]n|cient[ií]fic[oa]|art[ií]culo|paper|publicaci[oó]n|acad[eé]mic[oa]|evidencia|medicina|salud)\b", query, re.I):
         sources.extend([search_crossref, search_openalex])
     results, errors = [], []
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+    pool = ThreadPoolExecutor(max_workers=len(sources))
+    try:
         jobs = {pool.submit(fn, query): fn.__name__ for fn in sources}
-        for job in as_completed(jobs, timeout=35):
-            name = jobs[job]
-            try:
-                results.extend(job.result())
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
+        done, pending = wait(jobs, timeout=20)
+        for job, name in jobs.items():
+            if job in pending:
+                errors.append(f"{name}: tiempo de espera agotado")
+            elif job in done:
+                try:
+                    results.extend(job.result())
+                except Exception:
+                    errors.append(f"{name}: consulta fallida")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     unique = {}
     for item in results:
         unique.setdefault(item["url"], item)
@@ -233,7 +267,7 @@ def research_online(query: str) -> tuple[list[dict], list[str]]:
 
 def save_research_results(results: list[dict]):
     now = datetime.now().astimezone().isoformat(timespec="minutes")
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         for item in results:
             if item.get("pageid"):
                 db.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?)",
@@ -243,7 +277,7 @@ def save_research_results(results: list[dict]):
 
 
 def save_pages(pages: list[dict]):
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         for page in pages:
             db.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?)",
                        (page["pageid"], page["title"], page["url"], page["extract"],
@@ -256,7 +290,7 @@ def find_local(query: str, limit: int = 8) -> list[dict]:
         return []
     clauses = " OR ".join("lower(title || ' ' || extract) LIKE ?" for _ in terms)
     params = [f"%{term}%" for term in terms]
-    with sqlite3.connect(DB_PATH) as db:
+    with open_database() as db:
         db.row_factory = sqlite3.Row
         page_clauses = " OR ".join("lower(title || ' ' || extract) LIKE ?" for _ in terms)
         result_clauses = " OR ".join("lower(title || ' ' || extract) LIKE ?" for _ in terms)
@@ -318,21 +352,10 @@ def is_video_query(query: str) -> bool:
                 and re.search(r"\b(recomend\w*|recom[ií]end\w*|sugier\w*|busc\w*|encuentr\w*|quiero\s+ver|ver)\b", query, re.I))
 
 
-def video_topic_from_recent(query: str) -> str:
+def video_topic(query: str) -> str:
     topic = re.sub(r"\b(?:me\s+)?(?:recomiend\w*|recomend\w*|sugier\w*|busc\w*|encuentr\w*|quiero\s+ver|v[ií]deos?|youtube|documentales?|canales?|sobre|de|relacionad\w*)\b", " ", query, flags=re.I)
     topic = re.sub(r"\s+", " ", topic).strip(" ,.:;?¿¡!")
-    if len(topic) > 2:
-        return topic
-    with sqlite3.connect(DB_PATH) as db:
-        prior = db.execute("SELECT text FROM conversations WHERE role='user' ORDER BY id DESC LIMIT 8").fetchall()
-    skip = {query.casefold()}
-    for (text,) in prior:
-        if text.casefold() in skip or is_video_query(text) or conversational_reply(text):
-            continue
-        if len(text.split()) >= 2:
-            topic = re.sub(r"^(?:qu[eé]\s+sabes\s+de|qu[eé]\s+es|cu[eé]ntame\s+(?:sobre|de)|h[aá]blame\s+de|investiga\s+(?:sobre|acerca\s+de))\s+", "", text, flags=re.I)
-            return topic or text
-    return ""
+    return topic if len(topic) > 2 else ""
 
 
 def is_calculation_query(query: str) -> bool:
@@ -361,14 +384,18 @@ class App(tk.Tk):
         self.minsize(720, 520)
         self._set_dark_theme()
         self.busy = False
+        self._events = SimpleQueue()
+        self._closing = False
+        self._generation = 0
         self.brain = None
         self.brain_error = None
         self.link_counter = 0
         self._load_prefs()
-        self.internet_var = tk.BooleanVar(value=bool(self._prefs.get("internet_allowed", False)))
+        self.internet_var = tk.BooleanVar(value=False)
         self.collect_var = tk.BooleanVar(value=bool(self._prefs.get("collect_enabled", False)))
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(40, self._drain_events)
         self.after(30000, self._auto_tick)
         self._say("Daras", "Hola. Estoy aquí para conversar, resolver cuentas, explorar curiosidades y ayudarte a encontrar cosas interesantes. Si no sé algo, prefiero reconocerlo; con tu permiso también puedo investigar y mostrarte las fuentes.")
         self.status.set("Cargando tu modelo Cerebro…")
@@ -399,7 +426,7 @@ class App(tk.Tk):
         ttk.Label(top, text="DARAS", font=("TkDefaultFont", 17, "bold"), foreground="#71baff").pack(side="left")
         ttk.Label(top, text="  ·  mentor personal", font=("TkDefaultFont", 10)).pack(side="left", pady=(5, 0))
         ttk.Checkbutton(top, text="Dar acceso a Internet para investigar", variable=self.internet_var,
-                        command=self._save_prefs).pack(side="right")
+                        command=self._internet_changed).pack(side="right")
         self.chat = scrolledtext.ScrolledText(self, wrap="word", state="disabled", font=("TkDefaultFont", 11))
         self.chat.pack(fill="both", expand=True, padx=12, pady=(0, 10))
         self.chat.configure(background="#091522", foreground="#e4edf8", insertbackground="#ffffff",
@@ -457,20 +484,40 @@ class App(tk.Tk):
         self.chat.configure(state="disabled")
         self.chat.see("end")
 
+    def _drain_events(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                callback = self._events.get_nowait()
+                callback()
+        except Empty:
+            pass
+        finally:
+            if not self._closing:
+                self.after(40, self._drain_events)
+
+    def _internet_changed(self):
+        if not self.internet_var.get():
+            self._generation += 1
+            self.status.set("Internet desactivado. Los resultados pendientes se descartarán.")
+
+    def _brain_loaded(self, brain, error=None):
+        self.brain, self.brain_error = brain, error
+        self.status.set("El modelo Cerebro no pudo cargar." if error else "Daras está listo. Cerebro funciona sin conexión.")
+
     def _load_brain_worker(self):
         try:
             brain = load_cerebro()
-            with sqlite3.connect(DB_PATH) as db:
+            with open_database() as db:
                 stored = db.execute("SELECT id, note FROM memories ORDER BY id").fetchall()
             for memory_id, note in stored:
                 key = f"recuerdo_{memory_id}"
                 if key not in brain.memoria.long_term_memory:
                     brain.memoria.guardar_largo_plazo(key, note, categoria="usuario", importancia=3)
-            self.brain = brain
-            self.after(0, lambda: self.status.set("Daras está listo. El modelo Cerebro funciona sin conexión."))
+            self._events.put(lambda: self._brain_loaded(brain))
         except Exception as exc:
-            self.brain_error = str(exc)
-            self.after(0, lambda error=str(exc): self.status.set(f"El modelo no pudo cargar: {error}"))
+            self._events.put(lambda error=str(exc): self._brain_loaded(None, error))
 
     def _answer_with_brain(self, query: str):
         if self.brain is None:
@@ -495,16 +542,6 @@ class App(tk.Tk):
             answer = self._answer_with_brain(query) if is_greeting and self.brain else smalltalk
             self._say("Daras", answer)
             return
-        normalized = query.casefold()
-        access_request = ("internet" in normalized and ":" not in query
-                          and (any(word in normalized for word in ("acceso", "autoriz", "permiso", "conecta"))
-                               or normalized.strip(" .,!?¿¡") in {"daras investiga por internet", "investiga por internet"})
-                          and len(query.split()) < 12)
-        if access_request:
-            self.internet_var.set(True)
-            self._save_prefs()
-            self._say("Daras", "Entendido. Queda autorizado el acceso a Internet para investigar tus próximas preguntas. Buscaré en varias fuentes abiertas y te mostraré los enlaces; si alguna no responde, te lo diré.")
-            return
         if query.lower().startswith("recuerda:"):
             note = query.split(":", 1)[1].strip()
             if note:
@@ -516,7 +553,7 @@ class App(tk.Tk):
             return
         if query.lower().startswith("olvida:"):
             term = query.split(":", 1)[1].strip()
-            with sqlite3.connect(DB_PATH) as db:
+            with open_database() as db:
                 matching = db.execute("SELECT id FROM memories WHERE lower(note) LIKE ?", (f"%{term.lower()}%",)).fetchall() if term else []
                 removed = db.execute("DELETE FROM memories WHERE lower(note) LIKE ?", (f"%{term.lower()}%",)).rowcount if term else 0
             if self.brain:
@@ -524,24 +561,32 @@ class App(tk.Tk):
                     self.brain.memoria.eliminar_largo_plazo(f"recuerdo_{memory_id}")
             self._say("Daras", f"He borrado {removed} recuerdo(s) que coinciden." if removed else "No encontré recuerdos con ese texto.")
             return
-        explicit_search = any(phrase in normalized for phrase in ("investiga en internet:", "busca en internet:", "consulta en internet:"))
-        if explicit_search:
-            query = re.split(r"(?:investiga|busca|consulta) en internet:", query, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
-        local = find_local(query)
+        search = SEARCH_COMMAND.fullmatch(query)
+        if search:
+            query = search.group(1).strip()
+            if not query:
+                self._say("Daras", "Indica el tema que quieres buscar.")
+                return
         if is_calculation_query(query):
-            answer = self._answer_with_brain(query)
-            self._say("Daras", answer)
-        elif is_video_query(query):
-            topic = video_topic_from_recent(query)
-            if not topic:
-                self._say("Daras", "Claro. ¿Sobre qué tema quieres los vídeos? Si prefieres que busque enlaces actuales, activa el acceso a Internet o escribe «busca en internet: …».")
-            elif self.internet_var.get() or explicit_search:
-                self._research(topic, local, video_only=True)
+            self._say("Daras", self._answer_with_brain(query))
+            return
+        if search:
+            if not self.internet_var.get():
+                self._say("Daras", "Activa el acceso a Internet para enviar esta consulta.")
+            elif is_video_query(query):
+                topic = video_topic(query)
+                if topic:
+                    self._research(topic, video_only=True)
+                else:
+                    self._say("Daras", "Indica el tema de los vídeos en la consulta.")
             else:
-                self._say("Daras", f"Puedo proponerte vídeos sobre «{topic}», pero para darte enlaces actuales necesito que actives el acceso a Internet.")
-        elif self.internet_var.get() or explicit_search:
-            self._research(query, local)
-        elif local:
+                self._research(query)
+            return
+        if is_video_query(query):
+            self._say("Daras", "Para buscar vídeos, activa Internet y escribe «busca en internet: busca vídeos sobre …».")
+            return
+        local = find_local(query)
+        if local:
             self._say("Daras", answer_from_pages(query, local))
         elif is_out_of_corpus_scope(query):
             self._say("Daras", "Ese tema queda fuera de lo que mi pequeño modelo Cerebro aprendió. Prefiero no inventarte una respuesta. Activa Internet o escribe «investiga en internet: " + query + "» y buscaré fuentes.")
@@ -556,8 +601,9 @@ class App(tk.Tk):
             self._say("Daras", answer)
 
     def _research(self, query: str, local: list[dict] | None = None, video_only: bool = False):
-        if self.busy:
+        if self.busy or not self.internet_var.get():
             return
+        generation = self._generation
         self.busy = True
         self.ask_button.configure(state="disabled")
         self.status.set("Buscando vídeos relacionados…" if video_only else "Buscando y comparando varias fuentes abiertas…")
@@ -578,11 +624,21 @@ class App(tk.Tk):
                         errors = ["No pude recuperar vídeos individuales."]
                 else:
                     pages, errors = research_online(query)
-                save_research_results(pages)
-                self.after(0, lambda: self._research_done(query, pages, errors, video_only))
-            except Exception as exc:
-                self.after(0, lambda error=str(exc): self._research_done(query, local or [], [error], video_only))
+                self._events.put(lambda: self._finish_research(generation, query, pages, errors, video_only))
+            except Exception:
+                self._events.put(lambda: self._finish_research(generation, query, local or [], ["Consulta fallida"], video_only))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_research(self, generation, query, pages, errors, video_only):
+        if generation != self._generation or not self.internet_var.get():
+            self.busy = False
+            self.ask_button.configure(state="normal")
+            return
+        try:
+            save_research_results(pages)
+        except sqlite3.Error:
+            errors.append("No se pudo actualizar la biblioteca local")
+        self._research_done(query, pages, errors, video_only)
 
     def _research_done(self, query: str, pages: list[dict], errors: list[str], video_only: bool = False):
         self.busy = False
@@ -634,16 +690,26 @@ class App(tk.Tk):
                 prefs["last_collection"] = datetime.now().timestamp()
                 self._save_prefs()
                 self.status.set(f"Recopilando en varias fuentes el tema autorizado: {topic}")
-                threading.Thread(target=self._auto_worker, args=(topic,), daemon=True).start()
+                self.busy = True
+                threading.Thread(target=self._auto_worker, args=(topic, self._generation), daemon=True).start()
         self.after(30000, self._auto_tick)
 
-    def _auto_worker(self, topic: str):
+    def _auto_worker(self, topic: str, generation: int):
         try:
-            pages, _errors = research_online(topic)
+            pages, errors = research_online(topic)
+        except Exception:
+            pages, errors = [], ["Consulta fallida"]
+        self._events.put(lambda: self._auto_done(generation, pages, errors))
+
+    def _auto_done(self, generation, pages, errors):
+        self.busy = False
+        if generation != self._generation or not self.internet_var.get():
+            return
+        try:
             save_research_results(pages)
-            self.after(0, lambda: self.status.set(f"Recopilación terminada: {len(pages)} artículos sobre «{topic}»."))
-        except Exception as exc:
-            self.after(0, lambda error=str(exc): self.status.set(f"Recopilación pausada por error: {error}"))
+            self.status.set(f"Recopilación terminada: {len(pages)} artículos.")
+        except sqlite3.Error:
+            self.status.set("No se pudo guardar la recopilación.")
 
     def _load_prefs(self):
         try:
@@ -657,13 +723,25 @@ class App(tk.Tk):
         try:
             self._prefs["topics"] = self.topics.get("1.0", "end").strip()
             self._prefs["interval"] = int(self.interval.get() or 360)
-            self._prefs["internet_allowed"] = bool(self.internet_var.get())
+            self._prefs.pop("internet_allowed", None)
             self._prefs["collect_enabled"] = bool(self.collect_var.get())
-            PREFS_PATH.write_text(json.dumps(self._prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=PREFS_PATH.parent, delete=False,
+            ) as file:
+                temporary = Path(file.name)
+                try:
+                    json.dump(self._prefs, file, ensure_ascii=False, indent=2)
+                    file.flush()
+                    os.fsync(file.fileno())
+                    file.close()
+                    os.replace(temporary, PREFS_PATH)
+                finally:
+                    temporary.unlink(missing_ok=True)
         except (OSError, ValueError, tk.TclError):
             pass
 
     def _close(self):
+        self._closing = True
         self._save_prefs()
         self.destroy()
 

@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+/config.json
+/biblioteca.sqlite3
+/biblioteca.sqlite3-*
+/daras_cerebro_memoria.json
