@@ -55,3 +55,19 @@ atribuciones y condiciones de origen.
 Codex, una herramienta de IA de OpenAI, asistió con la implementación, las pruebas
 y esta documentación. Consulta la [auditoría de estabilidad](docs/STABILITY_AUDIT.md)
 para ver los límites de verificación y los requisitos pendientes de 1.0.
+
+## DARAS como especialista de CEREBRO
+
+`python3 -m especialista` recibe una línea JSON por entrada estándar.
+Ejemplo local, sin red:
+
+```sh
+printf '%s\n' '{"version":1,"accion":"planificar","objetivo":"Prototipo de robot","semilla":42}' | python3 -m especialista
+```
+
+Este modo metódico registra planes, dependencias, estados, fuentes y
+estimaciones en la biblioteca SQLite. `replanificar` acepta los identificadores
+de tareas completadas. La simulación Monte Carlo usa una semilla y duraciones
+triangulares de referencia. `investigar` usa la biblioteca local, salvo que
+la solicitud autorizada indique `"red":true`. Cada extracto conserva su URL.
+La planificación actual sigue una plantilla y las duraciones son supuestos.
