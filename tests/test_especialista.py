@@ -31,3 +31,14 @@ class Especialista(unittest.TestCase):
             self.assertEqual(primero["evidencia"][0]["url"], "https://ejemplo.org/robot")
             with companiona.open_database() as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM specialist_runs").fetchone()[0], 1)
+
+    def test_fuentes_autorizadas_quedan_en_biblioteca(self):
+        fuente = {"url": "https://ejemplo.org/robot", "source": "Manual",
+                  "title": "Robots", "extract": "Documentación."}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(companiona, "DB_PATH", Path(tmp) / "daras.db"):
+            objetivo = {"version": 1, "accion": "investigar", "objetivo": "Robots"}
+            with patch("especialista.research_online", return_value=([fuente], [])):
+                self.assertTrue(coordinar({**objetivo, "red": True})["red_autorizada"])
+            resultado = coordinar(objetivo)
+            self.assertFalse(resultado["red_autorizada"])
+            self.assertEqual(resultado["evidencia"][0]["url"], fuente["url"])

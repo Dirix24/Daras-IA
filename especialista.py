@@ -7,7 +7,7 @@ import json
 import random
 import sys
 
-from companiona import find_local, init_db, open_database, research_online
+from companiona import find_local, init_db, open_database, research_online, save_research_results
 
 VERSION = 1
 TAREAS = (
@@ -64,7 +64,16 @@ def coordinar(peticion):
     init_db()
     fuentes, avisos = [], []
     if accion == "investigar":
-        fuentes, avisos = research_online(objetivo) if red else (find_local(objetivo, limit=5), [])
+        if red:
+            fuentes, avisos = research_online(objetivo)
+            if fuentes:
+                save_research_results(fuentes)
+            else:
+                fuentes = find_local(objetivo, limit=5)
+                if fuentes:
+                    avisos.append("Se recuperaron fuentes de la biblioteca local.")
+        else:
+            fuentes = find_local(objetivo, limit=5)
     pasos = plan(peticion.get("completadas", []))
     resultado = {"version": VERSION, "especialista": "DARAS", "estado": "ok", "accion": accion,
                  "objetivo": objetivo, "plan": pasos,
